@@ -15,17 +15,19 @@ import {
   Space,
   Statistic,
   Tag,
+  Tooltip,
   Typography,
   message,
 } from 'antd'
 import { ArrowLeftOutlined, PhoneOutlined, SafetyOutlined } from '@ant-design/icons'
 import { useStore, GRID_WORKERS, nearestWorker } from '../store/useStore'
 import { CLOSURE_LABEL, ClosureCategory, ESCALATION_LABEL } from '../types'
-import { FALSE_REASONS } from '../store/workflow'
+import { ELDER_STATUS_OPTIONS, FALSE_REASONS, SITE_RESULT_OPTIONS, canCloseEvent, canDispatchVisit } from '../store/workflow'
 import { AlertTypeTag, SeverityTag, StatusTag, fmtMinutes, fmtTime } from '../components/common'
 import ElderInfoCard from '../components/ElderInfoCard'
 import PlanSteps from '../components/PlanSteps'
 import EventTimeline from '../components/EventTimeline'
+import DutyEscalationPanel from '../components/DutyEscalationPanel'
 
 const { Text, Title } = Typography
 
@@ -40,6 +42,11 @@ const EventDetailPage: React.FC = () => {
   const [visitModal, setVisitModal] = useState(false)
   const [visitResult, setVisitResult] = useState<'ok' | 'no_answer' | 'need_medical'>('ok')
   const [visitNote, setVisitNote] = useState('')
+  const [arrivalModal, setArrivalModal] = useState(false)
+  const [arrivalForm] = Form.useForm()
+  const [siteReportModal, setSiteReportModal] = useState(false)
+  const [siteReportForm] = Form.useForm()
+  const sentToHospital = Form.useWatch('sentToHospital', siteReportForm)
   const [medicalModal, setMedicalModal] = useState(false)
   const [medicalForm] = Form.useForm()
   const [followUpModal, setFollowUpModal] = useState(false)
@@ -59,6 +66,9 @@ const EventDetailPage: React.FC = () => {
 
   const closed = ev.status === 'closed'
   const worker = nearestWorker(elder, GRID_WORKERS)
+  const dispatchable = canDispatchVisit(ev)
+  const closable = canCloseEvent(ev)
+  const needMedicalRecord = (ev.medical?.called120 || ev.doorVisit?.siteReport?.sentToHospital) && !ev.medical?.outcome
 
   const familyAct = (response: 'false_alarm' | 'request_call' | 'request_visit' | 'called_120') => {
     store.familyRespond(ev.id, response, familyNote)
@@ -102,6 +112,8 @@ const EventDetailPage: React.FC = () => {
           }
         />
       )}
+
+      {ev.dutyEscalation && <DutyEscalationPanel event={ev} elder={elder} />}
 
       <Row gutter={12}>
         {/* 左：老人与设备信息（社区视角） */}
@@ -168,14 +180,23 @@ const EventDetailPage: React.FC = () => {
                   value={phoneNote}
                   onChange={(e) => setPhoneNote(e.target.value)}
                 />
-                {!ev.doorVisit && ev.status !== 'medical' && (
-                  <Button type="primary" block onClick={() => store.dispatchVisit(ev.id, worker.name)}>
-                    派单上门（就近：{worker.name}，约{worker.distanceMin}分钟）
-                  </Button>
+                {!ev.doorVisit && ev.status !== 'medical' && ev.status !== 'follow_up' && (
+                  <>
+                    <Tooltip title={!dispatchable ? '值班员升级事件：需先电话核实无果（至少 1 次无人接听）后方可派单' : ''}>
+                      <Button type="primary" block disabled={!dispatchable} onClick={() => store.dispatchVisit(ev.id, worker.name)}>
+                        派单上门（就近：{worker.name}，约{worker.distanceMin}分钟）
+                      </Button>
+                    </Tooltip>
+                    {!dispatchable && (
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        请先进行电话核实，确认无果（无人接听）后再派网格员上门
+                      </Text>
+                    )}
+                  </>
                 )}
                 {ev.doorVisit && !ev.doorVisit.arrivedAt && (
-                  <Button block onClick={() => store.recordArrival(ev.id)}>
-                    记录到达（{ev.doorVisit.assignee}）
+                  <Button type="primary" block onClick={() => setArrivalModal(true)}>
+                    到达登记（{ev.doorVisit.assignee}）：到达时间 / 物业 / 急救
                   </Button>
                 )}
                 {ev.doorVisit && ev.doorVisit.arrivedAt && !ev.doorVisit.result && (
@@ -199,9 +220,14 @@ const EventDetailPage: React.FC = () => {
                     呼叫120急救
                   </Button>
                 )}
-                {ev.medical?.called120 && !ev.medical.outcome && (
+                {needMedicalRecord && (
                   <Button type="primary" block onClick={() => setMedicalModal(true)}>
                     记录就医结果
+                  </Button>
+                )}
+                {ev.doorVisit && !ev.doorVisit.siteReport && (ev.doorVisit.result || ev.status === 'follow_up') && (
+                  <Button type="primary" block onClick={() => setSiteReportModal(true)}>
+                    补充上门现场报告（结案前必填）
                   </Button>
                 )}
                 {ev.status === 'follow_up' && !ev.followUp && (
@@ -210,11 +236,93 @@ const EventDetailPage: React.FC = () => {
                   </Button>
                 )}
                 {ev.status === 'follow_up' && ev.followUp && (
-                  <Button type="primary" block icon={<SafetyOutlined />} onClick={() => setCloseModal(true)}>
-                    结案并生成复盘
-                  </Button>
+                  <>
+                    <Tooltip title={!closable ? '有上门记录的事件需先由网格员补充现场报告（现场结果/老人状态/是否送医/是否复访）' : ''}>
+                      <Button type="primary" block icon={<SafetyOutlined />} disabled={!closable} onClick={() => setCloseModal(true)}>
+                        结案并生成复盘
+                      </Button>
+                    </Tooltip>
+                    {!closable && (
+                      <Text type="danger" style={{ fontSize: 12 }}>
+                        请先补充上门现场报告，事件才允许关闭
+                      </Text>
+                    )}
+                  </>
                 )}
               </Space>
+            </Card>
+          )}
+
+          {ev.doorVisit && (
+            <Card size="small" title="上门处置记录" style={{ marginBottom: 12 }}>
+              <Descriptions column={1} size="small" bordered
+                items={[
+                  { key: 'dispatch', label: '派单', children: `${fmtTime(ev.doorVisit.dispatchedAt)} · ${ev.doorVisit.assignee}` },
+                  ...(ev.doorVisit.arrivedAt
+                    ? [
+                        {
+                          key: 'arrive',
+                          label: '到达登记',
+                          children: (
+                            <Space size={4} wrap>
+                              <Text style={{ fontSize: 12 }}>{fmtTime(ev.doorVisit.arrivedAt)}</Text>
+                              <Tag color={ev.doorVisit.propertyContacted ? 'geekblue' : 'default'}>
+                                {ev.doorVisit.propertyContacted ? '已联系物业' : '未联系物业'}
+                              </Tag>
+                              <Tag color={ev.doorVisit.firstAidNeeded ? 'red' : 'default'}>
+                                {ev.doorVisit.firstAidNeeded ? '需要急救' : '无需急救'}
+                              </Tag>
+                            </Space>
+                          ),
+                        },
+                      ]
+                    : []),
+                  ...(ev.doorVisit.result
+                    ? [
+                        {
+                          key: 'result',
+                          label: '上门结果',
+                          children: { ok: '老人平安', no_answer: '无人开门', need_medical: '需医疗处置' }[ev.doorVisit.result],
+                        },
+                      ]
+                    : []),
+                  ...(ev.doorVisit.propertyInvolved
+                    ? [{ key: 'prop', label: '物业联动', children: ev.doorVisit.usedKeyCustody ? '物业协助 + 使用托管钥匙入户' : '物业协助开门' }]
+                    : []),
+                  ...(ev.doorVisit.siteReport
+                    ? [
+                        {
+                          key: 'site',
+                          label: '现场报告',
+                          children: (
+                            <Space direction="vertical" size={2}>
+                              <Text style={{ fontSize: 12 }}>现场结果：{ev.doorVisit.siteReport.result}</Text>
+                              <Text style={{ fontSize: 12 }}>老人状态：{ev.doorVisit.siteReport.elderStatus}</Text>
+                              <Space size={4}>
+                                <Tag color={ev.doorVisit.siteReport.sentToHospital ? 'red' : 'default'}>
+                                  {ev.doorVisit.siteReport.sentToHospital ? '已送医' : '未送医'}
+                                </Tag>
+                                <Tag color={ev.doorVisit.siteReport.needRevisit ? 'orange' : 'default'}>
+                                  {ev.doorVisit.siteReport.needRevisit ? '需后续复访' : '无需复访'}
+                                </Tag>
+                              </Space>
+                              <Text type="secondary" style={{ fontSize: 12 }}>
+                                {fmtTime(ev.doorVisit.siteReport.at)} · {ev.doorVisit.siteReport.by}
+                                {ev.doorVisit.siteReport.note ? ` · ${ev.doorVisit.siteReport.note}` : ''}
+                              </Text>
+                            </Space>
+                          ),
+                        },
+                      ]
+                    : [
+                        {
+                          key: 'site-pending',
+                          label: '现场报告',
+                          children: <Tag color="gold">待网格员补充（结案前必填）</Tag>,
+                        },
+                      ]),
+                ]}
+              />
             </Card>
           )}
 
@@ -258,6 +366,13 @@ const EventDetailPage: React.FC = () => {
               </Row>
               <Descriptions column={1} size="small" bordered>
                 {ev.closure.falseReason && <Descriptions.Item label="误报原因">{ev.closure.falseReason}</Descriptions.Item>}
+                {ev.doorVisit?.siteReport && (
+                  <Descriptions.Item label="上门现场报告">
+                    {ev.doorVisit.siteReport.result}；老人状态：{ev.doorVisit.siteReport.elderStatus}；
+                    {ev.doorVisit.siteReport.sentToHospital ? '已送医' : '未送医'}；
+                    {ev.doorVisit.siteReport.needRevisit ? '需后续复访' : '无需复访'}（{ev.doorVisit.siteReport.by}）
+                  </Descriptions.Item>
+                )}
                 <Descriptions.Item label="设备调整建议">{ev.closure.deviceSuggestion}</Descriptions.Item>
                 <Descriptions.Item label="复盘总结">{ev.closure.summary}</Descriptions.Item>
                 <Descriptions.Item label="结案">
@@ -268,6 +383,112 @@ const EventDetailPage: React.FC = () => {
           )}
         </Col>
       </Row>
+
+      {/* 到达登记：到达时间自动记录，同时登记是否联系物业、是否需要急救 */}
+      <Modal
+        title="到达登记"
+        open={arrivalModal}
+        onCancel={() => setArrivalModal(false)}
+        onOk={() =>
+          arrivalForm.validateFields().then((v) => {
+            store.recordArrival(ev.id, { propertyContacted: v.propertyContacted, firstAidNeeded: v.firstAidNeeded, note: v.note })
+            setArrivalModal(false)
+            arrivalForm.resetFields()
+            message.success(`已记录到达时间${v.firstAidNeeded ? '，现场需要急救，请立即联动120' : ''}`)
+          })
+        }
+      >
+        <Form form={arrivalForm} layout="vertical" initialValues={{ propertyContacted: false, firstAidNeeded: false }}>
+          <Form.Item label="到达时间">
+            <Text>提交时自动记录当前时间（{ev.doorVisit?.assignee}）</Text>
+          </Form.Item>
+          <Form.Item name="propertyContacted" label="是否已联系物业" rules={[{ required: true }]}>
+            <Radio.Group
+              options={[
+                { value: true, label: '是（已联系物业值班）' },
+                { value: false, label: '否' },
+              ]}
+              optionType="button"
+              buttonStyle="solid"
+            />
+          </Form.Item>
+          <Form.Item name="firstAidNeeded" label="现场是否需要急救" rules={[{ required: true }]}>
+            <Radio.Group
+              options={[
+                { value: true, label: '需要急救' },
+                { value: false, label: '暂不需要' },
+              ]}
+              optionType="button"
+              buttonStyle="solid"
+            />
+          </Form.Item>
+          <Form.Item name="note" label="备注（可选）">
+            <Input.TextArea rows={2} placeholder="如：敲门无人应答，物业正在赶来" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* 上门现场报告：结案前必填 */}
+      <Modal
+        title="补充上门现场报告"
+        open={siteReportModal}
+        onCancel={() => setSiteReportModal(false)}
+        onOk={() =>
+          siteReportForm.validateFields().then((v) => {
+            store.recordSiteReport(ev.id, {
+              result: v.result,
+              elderStatus: v.elderStatus,
+              sentToHospital: v.sentToHospital,
+              needRevisit: v.needRevisit,
+              note: v.note,
+            })
+            setSiteReportModal(false)
+            siteReportForm.resetFields()
+            message.success(v.sentToHospital ? '现场报告已提交，老人已送医，请补记就医结果' : '现场报告已提交，事件可进入结案流程')
+          })
+        }
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="上门结束后由网格员补充，事件关闭前必填"
+        />
+        <Form form={siteReportForm} layout="vertical" initialValues={{ sentToHospital: false, needRevisit: false }}>
+          <Form.Item name="result" label="现场结果" rules={[{ required: true, message: '请选择现场结果' }]}>
+            <Select options={SITE_RESULT_OPTIONS.map((r) => ({ value: r, label: r }))} placeholder="选择现场处置结果" />
+          </Form.Item>
+          <Form.Item name="elderStatus" label="老人状态" rules={[{ required: true, message: '请选择老人状态' }]}>
+            <Radio.Group options={ELDER_STATUS_OPTIONS.map((s) => ({ value: s, label: s }))} optionType="button" buttonStyle="solid" />
+          </Form.Item>
+          <Form.Item name="sentToHospital" label="是否送医" rules={[{ required: true }]}>
+            <Radio.Group
+              options={[
+                { value: true, label: '已送医' },
+                { value: false, label: '未送医' },
+              ]}
+              optionType="button"
+              buttonStyle="solid"
+            />
+          </Form.Item>
+          {sentToHospital && (
+            <Alert type="warning" showIcon style={{ marginBottom: 12 }} message="送医事件提交后需补记送医医院与诊断结果" />
+          )}
+          <Form.Item name="needRevisit" label="是否需要后续复访" rules={[{ required: true }]}>
+            <Radio.Group
+              options={[
+                { value: true, label: '需要复访' },
+                { value: false, label: '无需复访' },
+              ]}
+              optionType="button"
+              buttonStyle="solid"
+            />
+          </Form.Item>
+          <Form.Item name="note" label="补充说明（可选）">
+            <Input.TextArea rows={2} placeholder="如：建议家属更换浴室防滑垫" />
+          </Form.Item>
+        </Form>
+      </Modal>
 
       {/* 上门结果 */}
       <Modal

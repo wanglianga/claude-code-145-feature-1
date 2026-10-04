@@ -25,6 +25,7 @@ const DashboardPage: React.FC = () => {
 
   const active = events.filter((e) => e.status !== 'closed')
   const escalated = active.filter((e) => e.escalations.length > 0)
+  const dutyPending = active.filter((e) => e.dutyEscalation)
   const closedToday = events.filter((e) => e.status === 'closed' && e.closure && now() - e.closure.closedAt < 24 * 3600 * 1000)
 
   const rows = useMemo(
@@ -50,6 +51,26 @@ const DashboardPage: React.FC = () => {
           </Space>
         }
       />
+      {dutyPending.length > 0 && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={`${dutyPending.length} 起夜间跌倒告警家属超时未确认，已自动升级值班员处置`}
+          description={
+            <Space wrap>
+              {dutyPending.map((e) => (
+                <Button key={e.id} size="small" danger onClick={() => nav(`/events/${e.id}`)}>
+                  {e.id} · {elderName(e.elderId)} {e.dutyEscalation?.ackedAt ? '（已接管）' : '（待接管）'}
+                </Button>
+              ))}
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                请立即电话核实老人情况，无果后派网格员上门
+              </Text>
+            </Space>
+          }
+        />
+      )}
       <Row gutter={12} style={{ marginBottom: 12 }}>
         <Col span={6}>
           <Card size="small">

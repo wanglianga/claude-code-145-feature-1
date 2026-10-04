@@ -39,6 +39,7 @@ export const SEVERITY_LABEL: Record<Severity, string> = {
 /** 升级情形（触发即记录在事件内） */
 export type EscalationKind =
   | 'family_timeout' // 家属迟迟未响应
+  | 'duty_escalation' // 夜间跌倒无人响应，升级社区值班员
   | 'phone_no_answer' // 老人电话无人接
   | 'low_battery' // 设备低电
   | 'night_bathroom' // 夜间/浴室高风险场景
@@ -48,6 +49,7 @@ export type EscalationKind =
 
 export const ESCALATION_LABEL: Record<EscalationKind, string> = {
   family_timeout: '家属超时未响应',
+  duty_escalation: '夜间跌倒无人响应·升级值班员',
   phone_no_answer: '老人电话无人接听',
   low_battery: '设备电量过低',
   night_bathroom: '夜间/浴室高风险场景',
@@ -142,6 +144,24 @@ export interface PhoneAttempt {
   note?: string
 }
 
+/** 上门结束后网格员补充的现场报告（结案前必填） */
+export interface SiteReport {
+  at: number
+  by: string // 网格员姓名
+  result: string // 现场结果
+  elderStatus: string // 老人状态
+  sentToHospital: boolean // 是否送医
+  needRevisit: boolean // 是否需要后续复访
+  note?: string
+}
+
+/** 夜间跌倒家属超时未确认 → 自动升级社区值班员 */
+export interface DutyEscalation {
+  escalatedAt: number // 自动升级时间
+  ackedAt?: number // 值班员接管时间
+  ackedBy?: string // 接管值班员
+}
+
 export interface AlertEvent {
   id: string
   elderId: string
@@ -165,14 +185,19 @@ export interface AlertEvent {
     timedOut: boolean
   }
   phoneAttempts: PhoneAttempt[]
+  dutyEscalation?: DutyEscalation // 夜间跌倒无人响应升级值班员
   doorVisit?: {
     dispatchedAt: number
     assignee: string
-    arrivedAt?: number
+    arrivedAt?: number // 到达时间（到达登记时记录）
+    propertyContacted?: boolean // 到达登记：是否联系物业
+    firstAidNeeded?: boolean // 到达登记：是否需要急救
+    arrivalNote?: string // 到达登记备注
     result?: 'ok' | 'no_answer' | 'need_medical'
     note?: string
     propertyInvolved: boolean
     usedKeyCustody: boolean
+    siteReport?: SiteReport // 上门结束后网格员补充的现场报告
   }
   medical?: {
     called120: boolean

@@ -10,6 +10,7 @@ import {
   ESCALATION_LABEL,
   EventStatus,
   Session,
+  SiteReport,
   Thresholds,
   TimelineEntry,
 } from '../types'
@@ -17,6 +18,8 @@ import { DUTY_STAFF, GRID_WORKERS, dutyText, seedElders, seedEvents, seedProfile
 import {
   assessSeverity,
   buildDeviceSuggestion,
+  canCloseEvent,
+  canDispatchVisit,
   checkEscalations,
   communityHandleMinutes,
   emptyProfile,
@@ -43,12 +46,14 @@ export interface StoreState {
   fastForward: (minutes: number) => void
   tick: () => void
 
-  raiseAlert: (elderId: string, type: AlertType, location: string) => void
+  raiseAlert: (elderId: string, type: AlertType, location: string, opts?: { isNight?: boolean }) => void
   familyRespond: (eventId: string, response: NonNullable<AlertEvent['family']['response']>, note: string) => void
   recordPhoneAttempt: (eventId: string, result: 'answered' | 'no_answer', note: string) => void
+  ackDuty: (eventId: string) => void
   dispatchVisit: (eventId: string, assignee: string) => void
-  recordArrival: (eventId: string) => void
+  recordArrival: (eventId: string, info: { propertyContacted: boolean; firstAidNeeded: boolean; note?: string }) => void
   recordVisitResult: (eventId: string, result: 'ok' | 'no_answer' | 'need_medical', note: string) => void
+  recordSiteReport: (eventId: string, report: { result: string; elderStatus: string; sentToHospital: boolean; needRevisit: boolean; note?: string }) => void
   involveProperty: (eventId: string, useKey: boolean) => void
   call120: (eventId: string, by: 'family' | 'community') => void
   recordMedical: (eventId: string, hospital: string, outcome: string) => void
@@ -72,6 +77,7 @@ function applyEscalations(ev: AlertEvent, elder: Elder, now: number): AlertEvent
     next.escalations.push({ kind: f.kind, at: now, note: f.note })
     next = pushTimeline(next, { at: now, actor: 'system', kind: 'escalation', title: `升级：${ESCALATION_LABEL[f.kind]}`, detail: f.note })
     if (f.kind === 'family_timeout') next.family = { ...next.family, timedOut: true }
+    if (f.kind === 'duty_escalation' && !next.dutyEscalation) next.dutyEscalation = { escalatedAt: now }
   }
   return next
 }
@@ -108,13 +114,13 @@ export const useStore = create<StoreState>((set, get) => {
       }))
     },
 
-    /** 手环上报新告警 */
-    raiseAlert: (elderId, type, location) => {
+    /** 手环上报新告警（opts.isNight 供演示/自测指定夜间场景） */
+    raiseAlert: (elderId, type, location, opts) => {
       const s = get()
       const elder = s.elders.find((e) => e.id === elderId)
       if (!elder) return
       const now = s.now()
-      const isNight = isNightTime(new Date(now))
+      const isNight = opts?.isNight ?? isNightTime(new Date(now))
       const severity = assessSeverity(type, {
         isNight,
         location,
@@ -154,7 +160,7 @@ export const useStore = create<StoreState>((set, get) => {
       set((st) => ({ events: [ev, ...st.events] }))
     },
 
-    /** 家属端操作 */
+    /** 家属端操作（超时升级后响应：记录响应并同步已采取动作，不回退社区处置进度） */
     familyRespond: (eventId, response, note) => {
       const now = get().now()
       const labelMap = {
@@ -172,12 +178,26 @@ export const useStore = create<StoreState>((set, get) => {
       set((s) => ({
         events: s.events.map((ev) => {
           if (ev.id !== eventId || ev.family.respondedAt) return ev
+          const late = ev.family.timedOut
+          // 值班员已接管且社区已在处置：家属迟到的响应不回退进度（直接呼救120除外）
+          const communityEngaged = ev.dutyEscalation != null && ev.status !== 'pending_family'
+          let status = statusMap[response]
+          if (communityEngaged && response !== 'called_120') {
+            status = ev.status
+            if (response === 'request_visit' && !ev.doorVisit) status = 'door_visit'
+          }
           let next: AlertEvent = {
             ...ev,
-            status: statusMap[response],
+            status,
             family: { ...ev.family, respondedAt: now, response, note },
           }
-          next = pushTimeline(next, { at: now, actor: 'family', kind: 'confirm', title: labelMap[response], detail: note || undefined })
+          next = pushTimeline(next, {
+            at: now,
+            actor: 'family',
+            kind: 'confirm',
+            title: late ? `家属超时后响应：${labelMap[response]}` : labelMap[response],
+            detail: [note, communityEngaged ? '社区处置继续进行，已采取的动作已向家属同步' : ''].filter(Boolean).join('；') || undefined,
+          })
           if (response === 'called_120') {
             next.medical = { called120: true, at: now }
             next.escalations = [...next.escalations, { kind: 'need_120', at: now, note: '家属已直接拨打120，社区同步联动' }]
@@ -214,12 +234,31 @@ export const useStore = create<StoreState>((set, get) => {
       }))
     },
 
-    /** 派单上门 */
+    /** 值班员接管夜间跌倒无人响应升级事件 */
+    ackDuty: (eventId) => {
+      const now = get().now()
+      set((s) => ({
+        events: s.events.map((ev) => {
+          if (ev.id !== eventId || !ev.dutyEscalation || ev.dutyEscalation.ackedAt || ev.status === 'closed') return ev
+          const by = s.session?.userName ?? '值班员'
+          let next: AlertEvent = { ...ev, dutyEscalation: { ...ev.dutyEscalation, ackedAt: now, ackedBy: by } }
+          return pushTimeline(next, {
+            at: now,
+            actor: 'community',
+            kind: 'handle',
+            title: `值班员${by}已接管`,
+            detail: '夜间跌倒家属未确认升级事件，开始电话核实老人情况',
+          })
+        }),
+      }))
+    },
+
+    /** 派单上门（值班员升级事件须先电话核实无果，家属主动要求上门除外） */
     dispatchVisit: (eventId, assignee) => {
       const now = get().now()
       set((s) => ({
         events: s.events.map((ev) => {
-          if (ev.id !== eventId) return ev
+          if (ev.id !== eventId || !canDispatchVisit(ev)) return ev
           let next: AlertEvent = {
             ...ev,
             status: 'door_visit',
@@ -230,13 +269,40 @@ export const useStore = create<StoreState>((set, get) => {
       }))
     },
 
-    recordArrival: (eventId) => {
+    /** 到达登记：记录到达时间、是否联系物业、是否需要急救 */
+    recordArrival: (eventId, info) => {
       const now = get().now()
       set((s) => ({
         events: s.events.map((ev) => {
           if (ev.id !== eventId || !ev.doorVisit) return ev
-          let next: AlertEvent = { ...ev, doorVisit: { ...ev.doorVisit, arrivedAt: now } }
-          return pushTimeline(next, { at: now, actor: 'community', kind: 'visit', title: '网格员到达老人家门口' })
+          let next: AlertEvent = {
+            ...ev,
+            doorVisit: {
+              ...ev.doorVisit,
+              arrivedAt: now,
+              propertyContacted: info.propertyContacted,
+              firstAidNeeded: info.firstAidNeeded,
+              arrivalNote: info.note,
+            },
+          }
+          next = pushTimeline(next, {
+            at: now,
+            actor: 'community',
+            kind: 'visit',
+            title: '网格员到达老人家门口',
+            detail: [
+              info.propertyContacted ? `已联系物业（${DUTY_STAFF[2].role}${DUTY_STAFF[2].name}）` : '未联系物业',
+              info.firstAidNeeded ? '现场判断需要急救' : '暂不需要急救',
+              info.note,
+            ]
+              .filter(Boolean)
+              .join('；'),
+          })
+          if (info.firstAidNeeded && !next.escalations.some((e) => e.kind === 'need_120')) {
+            next.escalations = [...next.escalations, { kind: 'need_120', at: now, note: '网格员到达现场后判断需要急救，请值班员立即联动120' }]
+            next = pushTimeline(next, { at: now, actor: 'system', kind: 'escalation', title: '升级：需联动120急救', detail: '网格员现场判断需要急救' })
+          }
+          return next
         }),
       }))
     },
@@ -258,6 +324,34 @@ export const useStore = create<StoreState>((set, get) => {
           }
           const elder = s.elders.find((e) => e.id === ev.elderId)
           return elder ? applyEscalations(next, elder, now) : next
+        }),
+      }))
+    },
+
+    /** 上门结束后网格员补充现场报告（现场结果/老人状态/是否送医/是否复访），结案前必填 */
+    recordSiteReport: (eventId, report) => {
+      const now = get().now()
+      set((s) => ({
+        events: s.events.map((ev) => {
+          if (ev.id !== eventId || !ev.doorVisit || ev.doorVisit.siteReport || ev.status === 'closed') return ev
+          const by = ev.doorVisit.assignee
+          const siteReport: SiteReport = { ...report, at: now, by }
+          let next: AlertEvent = { ...ev, doorVisit: { ...ev.doorVisit, siteReport } }
+          next = pushTimeline(next, {
+            at: now,
+            actor: 'community',
+            kind: 'visit',
+            title: '网格员补充现场报告',
+            detail: `现场结果：${report.result}；老人状态：${report.elderStatus}；${report.sentToHospital ? '已送医' : '未送医'}；${
+              report.needRevisit ? '需要后续复访' : '无需复访'
+            }${report.note ? `；${report.note}` : ''}`,
+          })
+          // 送医：转入就医流程，需补记就医结果（已记录就医结果的不再回退）
+          if (report.sentToHospital && next.status !== 'medical' && !next.medical?.outcome) {
+            next.status = 'medical'
+            next = pushTimeline(next, { at: now, actor: 'system', kind: 'medical', title: '老人已送医', detail: '请值班员补记送医医院与诊断结果' })
+          }
+          return next
         }),
       }))
     },
@@ -314,7 +408,7 @@ export const useStore = create<StoreState>((set, get) => {
           let next: AlertEvent = {
             ...ev,
             status: 'follow_up',
-            medical: { called120: ev.medical?.called120 ?? true, at: ev.medical?.at ?? now, hospital, outcome },
+            medical: { called120: ev.medical?.called120 ?? false, at: ev.medical?.at ?? now, hospital, outcome },
           }
           return pushTimeline(next, { at: now, actor: 'medical', kind: 'medical', title: `送医：${hospital}`, detail: outcome })
         }),
@@ -334,12 +428,12 @@ export const useStore = create<StoreState>((set, get) => {
       }))
     },
 
-    /** 结案：生成复盘报告并沉淀照护画像 */
+    /** 结案：生成复盘报告并沉淀照护画像（有上门记录的事件须先补充现场报告） */
     closeEvent: (eventId, category, falseReason, summary) => {
       const now = get().now()
       set((s) => {
         const ev = s.events.find((e) => e.id === eventId)
-        if (!ev) return s
+        if (!ev || !canCloseEvent(ev)) return s
         const elder = s.elders.find((e) => e.id === ev.elderId)!
         const closure = {
           closedAt: now,

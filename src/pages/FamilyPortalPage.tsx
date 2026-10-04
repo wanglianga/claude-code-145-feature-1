@@ -5,6 +5,7 @@ import { useStore } from '../store/useStore'
 import { AlertTypeTag, SeverityTag, StatusTag, fmtTime } from '../components/common'
 import ElderInfoCard from '../components/ElderInfoCard'
 import EventTimeline from '../components/EventTimeline'
+import ActionsTaken from '../components/ActionsTaken'
 
 const { Header, Content } = Layout
 const { Title, Text } = Typography
@@ -80,6 +81,15 @@ const FamilyPortalPage: React.FC = () => {
                   message={`手环上报${ev.location}发生告警，请您尽快确认老人情况`}
                   description="如确认为误报请点击「确认误报」；如需社区协助请选择电话核实或要求上门；紧急情况请直接拨打120。"
                 />
+                {ev.dutyEscalation && (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    style={{ marginBottom: 12 }}
+                    message="您未及时确认，事件已自动升级社区值班员处置"
+                    description="社区值班员已介入电话核实并可能已派网格员上门，以下为社区已采取的动作；您仍可随时响应，响应后社区将同步继续处置。"
+                  />
+                )}
                 {!ev.family.respondedAt ? (
                   <>
                     <Input.TextArea
@@ -113,6 +123,7 @@ const FamilyPortalPage: React.FC = () => {
                     }，社区正在处置中`}
                   />
                 )}
+                <ActionsTaken event={ev} />
                 <div style={{ marginTop: 12 }}>
                   <EventTimeline event={ev} />
                 </div>

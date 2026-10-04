@@ -13,8 +13,8 @@ import {
 } from '../types'
 
 // ===================== 演示参数 =====================
-/** 家属响应超时（毫秒）。演示环境设为 3 分钟 */
-export const FAMILY_TIMEOUT_MS = 3 * 60 * 1000
+/** 家属响应超时（毫秒）。业务要求 5 分钟内未确认即自动升级社区值班员 */
+export const FAMILY_TIMEOUT_MS = 5 * 60 * 1000
 /** 电话核实无人接听达到该次数则建议上门 */
 export const PHONE_NO_ANSWER_LIMIT = 2
 /** 低电量阈值 */
@@ -87,15 +87,17 @@ export function generatePlan(ctx: PlanContext): PlanStep[] {
     conditional: false,
   })
 
-  // 电话核实：误报史多或中低等级先电话
-  if (highFalse || severity !== 'high') {
+  // 电话核实：误报史多、中低等级或夜间跌倒（家属可能未及时响应，需值班员电话核实）
+  if (highFalse || severity !== 'high' || (type === 'fall' && isNight)) {
     steps.push({
       key: 'phone_verify',
       title: '电话核实老人状态',
       desc: `值班人员拨打老人电话 ${elder.phone}，连续 ${PHONE_NO_ANSWER_LIMIT} 次无人接听即升级上门`,
       reason: highFalse
         ? `该老人历史误报 ${elder.historyFalseAlarms} 次，优先电话核实降低无效上门`
-        : `告警等级为${severity === 'medium' ? '重要' : '一般'}，先电话核实`,
+        : type === 'fall' && isNight
+          ? '夜间跌倒告警，家属可能未及时查看手机，值班员需主动电话核实'
+          : `告警等级为${severity === 'medium' ? '重要' : '一般'}，先电话核实`,
       conditional: false,
     })
   }
@@ -192,7 +194,7 @@ export function deriveStepStates(ev: AlertEvent): Record<string, StepState> {
     s.call_120 = ev.medical?.called120 ? 'done' : 'pending'
   }
   if (has('medical_follow')) {
-    s.medical_follow = ev.medical?.outcome ? 'done' : ev.medical?.called120 ? 'active' : 'pending'
+    s.medical_follow = ev.medical?.outcome ? 'done' : ev.medical?.called120 || ev.doorVisit?.siteReport?.sentToHospital ? 'active' : 'pending'
   }
   if (has('device_maintain')) {
     s.device_maintain = ev.status === 'closed' ? 'done' : 'pending'
@@ -227,8 +229,16 @@ export function checkEscalations(ev: AlertEvent, elder: Elder, now: number): Esc
   if (!has('low_battery') && ev.batteryAtAlert <= LOW_BATTERY) {
     out.push({ kind: 'low_battery', note: `告警时设备电量仅 ${ev.batteryAtAlert}%，需同步安排设备维护` })
   }
-  if (!has('family_timeout') && ev.status === 'pending_family' && !ev.family.respondedAt && now - ev.family.notifiedAt > FAMILY_TIMEOUT_MS) {
+  const familyTimedOut = ev.status === 'pending_family' && !ev.family.respondedAt && now - ev.family.notifiedAt >= FAMILY_TIMEOUT_MS
+  if (!has('family_timeout') && familyTimedOut) {
     out.push({ kind: 'family_timeout', note: `家属超过 ${Math.round(FAMILY_TIMEOUT_MS / 60000)} 分钟未响应，社区接管处置` })
+  }
+  // 夜间跌倒 + 家属超时未确认 → 自动升级社区值班员
+  if (!has('duty_escalation') && familyTimedOut && ev.type === 'fall' && ev.isNight) {
+    out.push({
+      kind: 'duty_escalation',
+      note: `夜间跌倒告警，家属 ${Math.round(FAMILY_TIMEOUT_MS / 60000)} 分钟内未确认，已自动升级社区值班员接管：电话核实无果后派网格员上门`,
+    })
   }
   const noAnswer = ev.phoneAttempts.filter((a) => a.result === 'no_answer').length
   if (!has('phone_no_answer') && noAnswer >= PHONE_NO_ANSWER_LIMIT) {
@@ -241,6 +251,30 @@ export function checkEscalations(ev: AlertEvent, elder: Elder, now: number): Esc
 }
 
 // ===================== 工具 =====================
+
+/** 是否允许派单上门：值班员升级事件需先电话核实无果（家属主动要求上门除外） */
+export function canDispatchVisit(ev: AlertEvent): boolean {
+  if (ev.doorVisit || ev.status === 'medical' || ev.status === 'follow_up' || ev.status === 'closed') return false
+  if (!ev.dutyEscalation) return true
+  return ev.phoneAttempts.some((a) => a.result === 'no_answer') || ev.family.response === 'request_visit'
+}
+
+/** 是否允许结案：有上门记录的事件必须先由网格员补充现场报告 */
+export function canCloseEvent(ev: AlertEvent): boolean {
+  return !ev.doorVisit || !!ev.doorVisit.siteReport
+}
+
+/** 现场报告-现场结果选项 */
+export const SITE_RESULT_OPTIONS = [
+  '老人平安，无异常',
+  '轻微磕碰，已现场处理',
+  '已协助老人起身，观察无碍',
+  '入户确认老人不在家中，已电话联系家属确认去向',
+  '现场需医疗处置，已协助送医',
+]
+
+/** 现场报告-老人状态选项 */
+export const ELDER_STATUS_OPTIONS = ['状态平稳', '需继续观察', '身体不适（未送医）', '已送医']
 
 export function nearestWorker(elder: Elder, workers: GridWorker[]): GridWorker {
   return (
