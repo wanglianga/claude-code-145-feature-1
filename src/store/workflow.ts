@@ -13,8 +13,8 @@ import {
 } from '../types'
 
 // ===================== 演示参数 =====================
-/** 家属响应超时（毫秒）。演示环境设为 3 分钟 */
-export const FAMILY_TIMEOUT_MS = 3 * 60 * 1000
+/** 家属响应超时（毫秒）：5 分钟内未确认则升级 */
+export const FAMILY_TIMEOUT_MS = 5 * 60 * 1000
 /** 电话核实无人接听达到该次数则建议上门 */
 export const PHONE_NO_ANSWER_LIMIT = 2
 /** 低电量阈值 */
@@ -82,7 +82,9 @@ export function generatePlan(ctx: PlanContext): PlanStep[] {
     title: '等待家属确认',
     desc: `家属可确认误报 / 请求电话核实 / 要求上门 / 直接拨打120。超过 ${Math.round(
       FAMILY_TIMEOUT_MS / 60000,
-    )} 分钟未响应将自动升级社区处置`,
+    )} 分钟未响应将自动升级社区处置${
+      type === 'fall' && isNight ? '；夜间跌倒告警无人确认将直接升级社区值班员接管' : ''
+    }`,
     reason: '家属是第一响应人，限时未响应需社区接管',
     conditional: false,
   })
@@ -181,7 +183,7 @@ export function deriveStepStates(ev: AlertEvent): Record<string, StepState> {
   }
 
   if (has('door_visit')) {
-    if (ev.doorVisit?.result) s.door_visit = 'done'
+    if (ev.doorVisit?.result || ev.doorVisit?.report) s.door_visit = 'done'
     else if (ev.doorVisit) s.door_visit = 'active'
     else s.door_visit = 'pending'
   }
@@ -230,6 +232,15 @@ export function checkEscalations(ev: AlertEvent, elder: Elder, now: number): Esc
   if (!has('family_timeout') && ev.status === 'pending_family' && !ev.family.respondedAt && now - ev.family.notifiedAt > FAMILY_TIMEOUT_MS) {
     out.push({ kind: 'family_timeout', note: `家属超过 ${Math.round(FAMILY_TIMEOUT_MS / 60000)} 分钟未响应，社区接管处置` })
   }
+  // 夜间跌倒告警：家属 5 分钟未确认 → 自动升级社区值班员接管
+  const familyOverdue =
+    ev.family.timedOut || (ev.status === 'pending_family' && !ev.family.respondedAt && now - ev.family.notifiedAt > FAMILY_TIMEOUT_MS)
+  if (!has('community_takeover') && ev.type === 'fall' && ev.isNight && familyOverdue) {
+    out.push({
+      kind: 'community_takeover',
+      note: '夜间跌倒告警家属5分钟内未确认，自动升级社区值班员：展示住址/最近活动/门禁备注/钥匙托管，先电话核实，无果即派网格员上门',
+    })
+  }
   const noAnswer = ev.phoneAttempts.filter((a) => a.result === 'no_answer').length
   if (!has('phone_no_answer') && noAnswer >= PHONE_NO_ANSWER_LIMIT) {
     out.push({ kind: 'phone_no_answer', note: `老人电话连续 ${noAnswer} 次无人接听，建议立即上门` })
@@ -238,6 +249,23 @@ export function checkEscalations(ev: AlertEvent, elder: Elder, now: number): Esc
     out.push({ kind: 'door_no_answer', note: '网格员上门无人开门，建议联动物业/使用托管钥匙' })
   }
   return out
+}
+
+// ===================== 结案门禁 =====================
+
+/** 返回阻止结案的原因列表；为空表示允许结案 */
+export function closureBlockers(ev: AlertEvent): string[] {
+  const blockers: string[] = []
+  if (ev.doorVisit && !ev.doorVisit.report) {
+    blockers.push('网格员尚未补充上门结束报告（现场结果、老人状态、是否送医、是否需要后续复访）')
+  }
+  if (ev.doorVisit?.report?.sentToHospital && !ev.medical?.outcome) {
+    blockers.push('上门结束报告记录为已送医/需送医，请先记录就医结果')
+  }
+  if (ev.doorVisit?.report?.needRevisit && !ev.followUp) {
+    blockers.push('上门结束报告标记需要后续复访，请先完成回访记录')
+  }
+  return blockers
 }
 
 // ===================== 工具 =====================

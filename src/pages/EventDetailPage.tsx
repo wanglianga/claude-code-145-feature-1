@@ -1,9 +1,10 @@
-import React, { useState } from 'react'
+import React, { useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Col,
   Descriptions,
   Form,
@@ -15,19 +16,35 @@ import {
   Space,
   Statistic,
   Tag,
+  Timeline,
   Typography,
   message,
 } from 'antd'
-import { ArrowLeftOutlined, PhoneOutlined, SafetyOutlined } from '@ant-design/icons'
+import {
+  ArrowLeftOutlined,
+  EnvironmentOutlined,
+  KeyOutlined,
+  LockOutlined,
+  PhoneOutlined,
+  SafetyOutlined,
+  ThunderboltOutlined,
+} from '@ant-design/icons'
 import { useStore, GRID_WORKERS, nearestWorker } from '../store/useStore'
-import { CLOSURE_LABEL, ClosureCategory, ESCALATION_LABEL } from '../types'
-import { FALSE_REASONS } from '../store/workflow'
+import { CLOSURE_LABEL, ClosureCategory, ELDER_STATUS_LABEL, ESCALATION_LABEL, DoorVisitReport } from '../types'
+import { FALSE_REASONS, closureBlockers } from '../store/workflow'
 import { AlertTypeTag, SeverityTag, StatusTag, fmtMinutes, fmtTime } from '../components/common'
 import ElderInfoCard from '../components/ElderInfoCard'
 import PlanSteps from '../components/PlanSteps'
 import EventTimeline from '../components/EventTimeline'
 
 const { Text, Title } = Typography
+
+const FAMILY_RESP_LABEL = {
+  false_alarm: '确认误报',
+  request_call: '请求电话核实',
+  request_visit: '要求上门',
+  called_120: '已拨打120',
+} as const
 
 const EventDetailPage: React.FC = () => {
   const { id } = useParams()
@@ -37,9 +54,15 @@ const EventDetailPage: React.FC = () => {
   const elder = store.elders.find((e) => e.id === ev?.elderId)
   const [familyNote, setFamilyNote] = useState('')
   const [phoneNote, setPhoneNote] = useState('')
-  const [visitModal, setVisitModal] = useState(false)
+  const [arrivalModal, setArrivalModal] = useState(false)
+  const [contactedProperty, setContactedProperty] = useState(false)
+  const [needEmergency, setNeedEmergency] = useState(false)
   const [visitResult, setVisitResult] = useState<'ok' | 'no_answer' | 'need_medical'>('ok')
   const [visitNote, setVisitNote] = useState('')
+  const [visitResultModal, setVisitResultModal] = useState(false)
+  const [reportModal, setReportModal] = useState(false)
+  const [reportForm] = Form.useForm()
+  const reportStatus = Form.useWatch('elderStatus', reportForm)
   const [medicalModal, setMedicalModal] = useState(false)
   const [medicalForm] = Form.useForm()
   const [followUpModal, setFollowUpModal] = useState(false)
@@ -47,6 +70,12 @@ const EventDetailPage: React.FC = () => {
   const [closeModal, setCloseModal] = useState(false)
   const [closeForm] = Form.useForm()
   const closeCategory = Form.useWatch('category', closeForm)
+
+  const takenOver = useMemo(
+    () => !!ev && (ev.family.timedOut || ev.escalations.some((e) => e.kind === 'community_takeover')),
+    [ev],
+  )
+  const blockers = useMemo(() => (ev ? closureBlockers(ev) : []), [ev])
 
   if (!ev || !elder) {
     return (
@@ -59,11 +88,26 @@ const EventDetailPage: React.FC = () => {
 
   const closed = ev.status === 'closed'
   const worker = nearestWorker(elder, GRID_WORKERS)
+  const phoneTriedNoAnswer = ev.phoneAttempts.some((a) => a.result === 'no_answer')
+  const dv = ev.doorVisit
+  const report: DoorVisitReport | undefined = dv?.report
 
   const familyAct = (response: 'false_alarm' | 'request_call' | 'request_visit' | 'called_120') => {
     store.familyRespond(ev.id, response, familyNote)
     setFamilyNote('')
-    message.success('家属操作已记录')
+    message.success(takenOver ? '家属的延迟响应已记录，社区处置继续推进' : '家属操作已记录')
+  }
+
+  const doClose = () => {
+    closeForm.validateFields().then((v) => {
+      const err = store.closeEvent(ev.id, v.category, v.falseReason, v.summary)
+      if (err) {
+        message.error(`暂不能结案：${err}`)
+        return
+      }
+      setCloseModal(false)
+      message.success('已结案，复盘报告已生成并沉淀至照护画像')
+    })
   }
 
   return (
@@ -94,13 +138,63 @@ const EventDetailPage: React.FC = () => {
             <Space direction="vertical" size={2}>
               {ev.escalations.map((e, i) => (
                 <Text key={i} style={{ fontSize: 12 }}>
-                  <Tag color="orange">{ESCALATION_LABEL[e.kind]}</Tag>
+                  <Tag color={e.kind === 'community_takeover' ? 'red' : 'orange'}>{ESCALATION_LABEL[e.kind]}</Tag>
                   {fmtTime(e.at)} · {e.note}
                 </Text>
               ))}
             </Space>
           }
         />
+      )}
+
+      {/* 夜间跌倒无人响应：社区值班员自动接管处置卡 */}
+      {takenOver && !closed && (
+        <Card
+          size="small"
+          style={{ marginBottom: 12, borderColor: '#ff4d4f', borderWidth: 1.5, background: '#fff2f0' }}
+          title={
+            <Space wrap>
+              <ThunderboltOutlined style={{ color: '#ff4d4f' }} />
+              <Text strong style={{ color: '#cf1322' }}>
+                升级处置卡 · 社区值班员已接管
+              </Text>
+              <Tag color="red">{ev.family.timedOut ? '家属5分钟未确认' : ''}</Tag>
+            </Space>
+          }
+        >
+          <Row gutter={12}>
+            <Col xs={24} md={12}>
+              <Descriptions column={1} size="small">
+                <Descriptions.Item label={<><EnvironmentOutlined /> 老人住址</>}>
+                  <Text strong>{elder.address}</Text>
+                </Descriptions.Item>
+                <Descriptions.Item label={<><LockOutlined /> 门禁备注</>}>{elder.accessInfo}</Descriptions.Item>
+                <Descriptions.Item label={<><KeyOutlined /> 钥匙托管</>}>{elder.keyCustody}</Descriptions.Item>
+              </Descriptions>
+            </Col>
+            <Col xs={24} md={12}>
+              <Text strong style={{ fontSize: 12 }}>
+                最近活动
+              </Text>
+              <Timeline
+                style={{ marginTop: 8, marginBottom: 0 }}
+                items={elder.trajectory.map((t) => ({
+                  children: (
+                    <Text style={{ fontSize: 12 }}>
+                      {fmtTime(t.at)} {t.place}
+                    </Text>
+                  ),
+                }))}
+              />
+            </Col>
+          </Row>
+          <Alert
+            style={{ marginTop: 8 }}
+            type="info"
+            showIcon
+            message="请先电话核实老人情况；电话核实无果（无人接听）后立即派网格员上门，到达后记录到达时间、是否联系物业与是否需要急救。"
+          />
+        </Card>
       )}
 
       <Row gutter={12}>
@@ -115,12 +209,14 @@ const EventDetailPage: React.FC = () => {
               <Descriptions.Item label="通知时间">{fmtTime(ev.family.notifiedAt)}</Descriptions.Item>
               <Descriptions.Item label="响应">
                 {ev.family.respondedAt ? (
-                  <Tag color="green">
-                    {fmtTime(ev.family.respondedAt)} ·{' '}
-                    {{ false_alarm: '确认误报', request_call: '请求电话核实', request_visit: '要求上门', called_120: '已拨打120' }[ev.family.response!]}
-                  </Tag>
+                  <Space direction="vertical" size={2}>
+                    <Tag color={takenOver ? 'orange' : 'green'}>
+                      {fmtTime(ev.family.respondedAt)} · {FAMILY_RESP_LABEL[ev.family.response!]}
+                    </Tag>
+                    {takenOver && <Text type="warning" style={{ fontSize: 12 }}>家属在社区接管后才响应，社区已采取的动作不受影响并继续推进</Text>}
+                  </Space>
                 ) : ev.family.timedOut ? (
-                  <Tag color="red">超时未响应，社区已接管</Tag>
+                  <Tag color="red">5分钟超时未响应，社区已接管</Tag>
                 ) : (
                   <Tag color="gold">等待响应中…</Tag>
                 )}
@@ -141,6 +237,10 @@ const EventDetailPage: React.FC = () => {
           {!closed && (
             <Card size="small" title="社区处置操作" style={{ marginBottom: 12 }}>
               <Space direction="vertical" style={{ width: '100%' }}>
+                {/* 1. 电话核实 */}
+                <Text strong style={{ fontSize: 13 }}>
+                  ① 电话核实老人
+                </Text>
                 <Space wrap>
                   <Button
                     icon={<PhoneOutlined />}
@@ -149,7 +249,7 @@ const EventDetailPage: React.FC = () => {
                       setPhoneNote('')
                     }}
                   >
-                    电话核实：已接听
+                    电话已接听
                   </Button>
                   <Button
                     danger
@@ -159,7 +259,7 @@ const EventDetailPage: React.FC = () => {
                       setPhoneNote('')
                     }}
                   >
-                    电话核实：无人接
+                    电话无人接
                   </Button>
                 </Space>
                 <Input.TextArea
@@ -168,35 +268,76 @@ const EventDetailPage: React.FC = () => {
                   value={phoneNote}
                   onChange={(e) => setPhoneNote(e.target.value)}
                 />
-                {!ev.doorVisit && ev.status !== 'medical' && (
-                  <Button type="primary" block onClick={() => store.dispatchVisit(ev.id, worker.name)}>
+                {takenOver && !dv && (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {phoneTriedNoAnswer ? '电话核实无果，可立即派网格员上门' : '接管后需先电话核实；无人接听后方可派单上门'}
+                  </Text>
+                )}
+
+                {/* 2. 派单上门 */}
+                {!dv && ev.status !== 'medical' && (
+                  <Button
+                    type="primary"
+                    block
+                    disabled={takenOver && !phoneTriedNoAnswer}
+                    onClick={() => store.dispatchVisit(ev.id, worker.name)}
+                  >
                     派单上门（就近：{worker.name}，约{worker.distanceMin}分钟）
                   </Button>
                 )}
-                {ev.doorVisit && !ev.doorVisit.arrivedAt && (
-                  <Button block onClick={() => store.recordArrival(ev.id)}>
-                    记录到达（{ev.doorVisit.assignee}）
+
+                {/* 3. 到达记录 */}
+                {dv && !dv.arrivedAt && (
+                  <Button block type="primary" onClick={() => setArrivalModal(true)}>
+                    记录到达（{dv.assignee}）
                   </Button>
                 )}
-                {ev.doorVisit && ev.doorVisit.arrivedAt && !ev.doorVisit.result && (
-                  <Button type="primary" block onClick={() => setVisitModal(true)}>
-                    记录上门结果
+
+                {dv?.arrivedAt && (
+                  <Card size="small" type="inner" title="网格员到达记录" style={{ width: '100%' }}>
+                    <Descriptions column={1} size="small">
+                      <Descriptions.Item label="到达时间">{fmtTime(dv.arrivedAt)}</Descriptions.Item>
+                      <Descriptions.Item label="是否联系物业">
+                        {dv.contactedProperty ? <Tag color="blue">已联系物业</Tag> : <Tag>未联系</Tag>}
+                      </Descriptions.Item>
+                      <Descriptions.Item label="是否需要急救">
+                        {dv.needEmergency ? <Tag color="red">需要急救（120）</Tag> : <Tag color="green">暂不需要</Tag>}
+                      </Descriptions.Item>
+                    </Descriptions>
+                  </Card>
+                )}
+
+                {/* 4. 入户初步结果（无人开门 / 平安 / 需医疗） */}
+                {dv?.arrivedAt && !dv.result && (
+                  <Button type="primary" block onClick={() => setVisitResultModal(true)}>
+                    记录入户初步结果
                   </Button>
                 )}
-                {ev.doorVisit?.result === 'no_answer' && !ev.doorVisit.propertyInvolved && (
+                {dv?.result === 'no_answer' && !dv.propertyInvolved && (
                   <Space wrap>
                     <Button onClick={() => store.involveProperty(ev.id, false)}>联动物业开门</Button>
                     <Button onClick={() => store.involveProperty(ev.id, true)}>使用托管钥匙入户</Button>
                   </Space>
                 )}
-                {ev.doorVisit?.propertyInvolved && !ev.doorVisit.result?.match(/ok|need_medical/) && (
-                  <Button type="primary" block onClick={() => setVisitModal(true)}>
-                    入户后记录结果
+                {dv?.result === 'no_answer' && dv.propertyInvolved && !report && (
+                  <Button type="primary" block onClick={() => setVisitResultModal(true)}>
+                    入户后记录初步结果
                   </Button>
                 )}
-                {!ev.medical?.called120 && ev.status !== 'follow_up' && (
+                {dv?.arrivedAt && dv.result && dv.result !== 'no_answer' && !report && (
+                  <Button type="primary" block onClick={() => setReportModal(true)}>
+                    网格员补充上门结束报告
+                  </Button>
+                )}
+
+                {dv?.needEmergency && !ev.medical?.called120 && (
                   <Button danger block onClick={() => store.call120(ev.id, 'community')}>
                     呼叫120急救
+                  </Button>
+                )}
+                {!dv?.needEmergency && !ev.medical?.called120 && !closed && ev.status !== 'follow_up' && (
+                  <Button danger block onClick={() => store.call120(ev.id, 'community')}>
+                    呼叫120急救（兜底）
                   </Button>
                 )}
                 {ev.medical?.called120 && !ev.medical.outcome && (
@@ -204,15 +345,52 @@ const EventDetailPage: React.FC = () => {
                     记录就医结果
                   </Button>
                 )}
+
+                {/* 5. 上门结束报告摘要 */}
+                {report && (
+                  <Card size="small" type="inner" title="上门结束报告" style={{ width: '100%' }}>
+                    <Descriptions column={1} size="small">
+                      <Descriptions.Item label="现场结果">{report.sceneResult}</Descriptions.Item>
+                      <Descriptions.Item label="老人状态">
+                        <Tag color={report.elderStatus === 'good' ? 'green' : report.elderStatus === 'minor' ? 'orange' : 'red'}>
+                          {ELDER_STATUS_LABEL[report.elderStatus]}
+                        </Tag>
+                      </Descriptions.Item>
+                      <Descriptions.Item label="是否送医">{report.sentToHospital ? <Tag color="red">已送医</Tag> : <Tag color="green">未送医</Tag>}</Descriptions.Item>
+                      <Descriptions.Item label="后续复访">
+                        {report.needRevisit ? <Tag color="orange">需要复访：{report.revisitNote ?? '待安排'}</Tag> : <Tag>无需复访</Tag>}
+                      </Descriptions.Item>
+                      <Descriptions.Item label="提交">
+                        {fmtTime(report.reportedAt)} · {report.reportedBy}
+                      </Descriptions.Item>
+                    </Descriptions>
+                  </Card>
+                )}
+
+                {/* 6. 回访 / 结案 */}
                 {ev.status === 'follow_up' && !ev.followUp && (
                   <Button block onClick={() => setFollowUpModal(true)}>
                     记录回访
                   </Button>
                 )}
+                {ev.status === 'follow_up' && ev.followUp && blockers.length > 0 && (
+                  <Alert type="error" showIcon message="暂不允许结案" description={blockers.join('；')} />
+                )}
                 {ev.status === 'follow_up' && ev.followUp && (
-                  <Button type="primary" block icon={<SafetyOutlined />} onClick={() => setCloseModal(true)}>
-                    结案并生成复盘
+                  <Button
+                    type="primary"
+                    block
+                    icon={<SafetyOutlined />}
+                    disabled={blockers.length > 0}
+                    onClick={() => setCloseModal(true)}
+                  >
+                    {dv && !report ? '网格员补充上门结束报告后才可结案' : '结案并生成复盘'}
                   </Button>
+                )}
+                {ev.status !== 'follow_up' && dv && !report && !closed && (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    上门结束后须由网格员补充现场结果、老人状态、是否送医与是否复访，事件才允许关闭。
+                  </Text>
                 )}
               </Space>
             </Card>
@@ -269,14 +447,40 @@ const EventDetailPage: React.FC = () => {
         </Col>
       </Row>
 
-      {/* 上门结果 */}
+      {/* 网格员到达：到达时间 + 是否联系物业 + 是否需要急救 */}
       <Modal
-        title="记录上门结果"
-        open={visitModal}
-        onCancel={() => setVisitModal(false)}
+        title="网格员到达现场"
+        open={arrivalModal}
+        onCancel={() => setArrivalModal(false)}
+        onOk={() => {
+          store.recordArrival(ev.id, contactedProperty, needEmergency)
+          setArrivalModal(false)
+          setContactedProperty(false)
+          setNeedEmergency(false)
+          message.success('到达时间与现场处置动作已记录')
+        }}
+      >
+        <Text type="secondary">到达时间：{fmtTime(store.now())}（自动记录）</Text>
+        <div style={{ marginTop: 12 }}>
+          <Checkbox checked={contactedProperty} onChange={(e) => setContactedProperty(e.target.checked)}>
+            已联系物业（值班到场/远程开门/待命）
+          </Checkbox>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <Checkbox checked={needEmergency} onChange={(e) => setNeedEmergency(e.target.checked)}>
+            现场判断需要急救（立即呼叫120）
+          </Checkbox>
+        </div>
+      </Modal>
+
+      {/* 入户初步结果 */}
+      <Modal
+        title="记录入户初步结果"
+        open={visitResultModal}
+        onCancel={() => setVisitResultModal(false)}
         onOk={() => {
           store.recordVisitResult(ev.id, visitResult, visitNote)
-          setVisitModal(false)
+          setVisitResultModal(false)
           setVisitNote('')
         }}
       >
@@ -284,12 +488,71 @@ const EventDetailPage: React.FC = () => {
           value={visitResult}
           onChange={(e) => setVisitResult(e.target.value)}
           options={[
-            { value: 'ok', label: '老人平安' },
+            { value: 'ok', label: '老人在场（待补充结束报告）' },
             { value: 'no_answer', label: '无人开门' },
             { value: 'need_medical', label: '需医疗处置' },
           ]}
         />
         <Input.TextArea rows={2} style={{ marginTop: 12 }} placeholder="现场情况备注" value={visitNote} onChange={(e) => setVisitNote(e.target.value)} />
+      </Modal>
+
+      {/* 上门结束报告（结案必填） */}
+      <Modal
+        title="网格员上门结束报告"
+        open={reportModal}
+        width={560}
+        onCancel={() => setReportModal(false)}
+        onOk={() =>
+          reportForm.validateFields().then((v) => {
+            store.submitVisitReport(ev.id, {
+              sceneResult: v.sceneResult,
+              elderStatus: v.elderStatus,
+              sentToHospital: v.sentToHospital,
+              needRevisit: v.needRevisit,
+              revisitNote: v.revisitNote,
+              note: v.note,
+            })
+            setReportModal(false)
+            reportForm.resetFields()
+            message.success('上门结束报告已提交')
+          })
+        }
+      >
+        <Form
+          form={reportForm}
+          layout="vertical"
+          initialValues={{ elderStatus: 'good', sentToHospital: false, needRevisit: false }}
+        >
+          <Form.Item name="sceneResult" label="现场结果" rules={[{ required: true, message: '请描述现场处置结果' }]}>
+            <Input.TextArea rows={3} placeholder="如：老人倒在浴室地面，右髋疼痛无法站立，意识清楚，已协助平卧保暖等待120" />
+          </Form.Item>
+          <Form.Item name="elderStatus" label="老人状态" rules={[{ required: true }]}>
+            <Radio.Group
+              options={(Object.keys(ELDER_STATUS_LABEL) as DoorVisitReport['elderStatus'][]).map((k) => ({
+                value: k,
+                label: ELDER_STATUS_LABEL[k],
+              }))}
+            />
+          </Form.Item>
+          <Form.Item name="sentToHospital" label="是否送医" valuePropName="checked">
+            <Checkbox>已送医/需送医{reportStatus === 'serious' ? '（老人状态为伤情较重，建议勾选）' : ''}</Checkbox>
+          </Form.Item>
+          <Form.Item name="needRevisit" label="是否需要后续复访" valuePropName="checked">
+            <Checkbox>需要后续复访</Checkbox>
+          </Form.Item>
+          <Form.Item noStyle shouldUpdate={(p, c) => p.needRevisit !== c.needRevisit}>
+            {({ getFieldValue }) =>
+              getFieldValue('needRevisit') ? (
+                <Form.Item name="revisitNote" label="复访安排" rules={[{ required: true, message: '请填写复访安排' }]}>
+                  <Input placeholder="如：明日上午上门复查髋部情况并电话告知女儿" />
+                </Form.Item>
+              ) : null
+            }
+          </Form.Item>
+          <Form.Item name="note" label="其他备注">
+            <Input.TextArea rows={2} placeholder="物业配合、钥匙使用、家属沟通等（可选）" />
+          </Form.Item>
+        </Form>
       </Modal>
 
       {/* 就医结果 */}
@@ -333,13 +596,7 @@ const EventDetailPage: React.FC = () => {
         title="结案并生成复盘报告"
         open={closeModal}
         onCancel={() => setCloseModal(false)}
-        onOk={() =>
-          closeForm.validateFields().then((v) => {
-            store.closeEvent(ev.id, v.category, v.falseReason, v.summary)
-            setCloseModal(false)
-            message.success('已结案，复盘报告已生成并沉淀至照护画像')
-          })
-        }
+        onOk={doClose}
       >
         <Form form={closeForm} layout="vertical" initialValues={{ category: 'device_false' as ClosureCategory }}>
           <Form.Item name="category" label="事件分类（区分设备误报 / 照护缺口 / 真实风险）" rules={[{ required: true }]}>

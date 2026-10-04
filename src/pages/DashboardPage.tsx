@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Alert, Button, Card, Col, Form, Input, Modal, Row, Select, Space, Statistic, Table, Tag, Typography, message } from 'antd'
+import { Alert, Button, Card, Checkbox, Col, Form, Input, Modal, Row, Select, Space, Statistic, Table, Tag, Typography, message } from 'antd'
 import { AlertOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useStore } from '../store/useStore'
 import { DUTY_STAFF } from '../store/seed'
@@ -118,7 +118,7 @@ const DashboardPage: React.FC = () => {
                 <Space size={2} wrap>
                   {r.escalations.length === 0 && <Text type="secondary">—</Text>}
                   {r.escalations.map((e, i) => (
-                    <Tag key={i} color="orange">
+                    <Tag key={i} color={e.kind === 'community_takeover' ? 'red' : 'orange'} icon={e.kind === 'community_takeover' ? <ThunderboltOutlined /> : undefined}>
                       {ESCALATION_LABEL[e.kind]}
                     </Tag>
                   ))}
@@ -136,14 +136,14 @@ const DashboardPage: React.FC = () => {
         onCancel={() => setModalOpen(false)}
         onOk={() => {
           form.validateFields().then((v) => {
-            raiseAlert(v.elderId, v.type, v.location)
+            raiseAlert(v.elderId, v.type, v.location, !!v.forceNight)
             setModalOpen(false)
             form.resetFields()
             message.success('已生成告警事件并通知家属')
           })
         }}
       >
-        <Form form={form} layout="vertical" initialValues={{ elderId: elders[0]?.id, type: 'fall', location: '家-浴室' }}>
+        <Form form={form} layout="vertical" initialValues={{ elderId: elders[0]?.id, type: 'fall', location: '家-浴室', forceNight: true }}>
           <Form.Item name="elderId" label="老人" rules={[{ required: true }]}>
             <Select options={elders.map((e) => ({ value: e.id, label: `${e.name}（${e.address}）` }))} />
           </Form.Item>
@@ -152,6 +152,9 @@ const DashboardPage: React.FC = () => {
           </Form.Item>
           <Form.Item name="location" label="告警位置" rules={[{ required: true }]}>
             <Select options={LOCATIONS.map((l) => ({ value: l, label: l }))} />
+          </Form.Item>
+          <Form.Item name="forceNight" label="夜间场景" valuePropName="checked">
+            <Checkbox>按夜间（22:00-06:00）场景判定 —— 跌倒告警家属5分钟未确认将自动升级社区值班员接管</Checkbox>
           </Form.Item>
         </Form>
       </Modal>

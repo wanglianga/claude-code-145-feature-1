@@ -39,6 +39,7 @@ export const SEVERITY_LABEL: Record<Severity, string> = {
 /** 升级情形（触发即记录在事件内） */
 export type EscalationKind =
   | 'family_timeout' // 家属迟迟未响应
+  | 'community_takeover' // 夜间跌倒无人响应，社区值班员自动接管
   | 'phone_no_answer' // 老人电话无人接
   | 'low_battery' // 设备低电
   | 'night_bathroom' // 夜间/浴室高风险场景
@@ -48,6 +49,7 @@ export type EscalationKind =
 
 export const ESCALATION_LABEL: Record<EscalationKind, string> = {
   family_timeout: '家属超时未响应',
+  community_takeover: '社区值班员已接管',
   phone_no_answer: '老人电话无人接听',
   low_battery: '设备电量过低',
   night_bathroom: '夜间/浴室高风险场景',
@@ -142,6 +144,24 @@ export interface PhoneAttempt {
   note?: string
 }
 
+/** 上门结束报告（网格员入户处置结束后补充，补齐后才允许结案） */
+export interface DoorVisitReport {
+  reportedAt: number
+  reportedBy: string
+  sceneResult: string // 现场结果
+  elderStatus: 'good' | 'minor' | 'serious' // 老人状态：平安无碍 / 轻伤受惊吓 / 伤情较重
+  sentToHospital: boolean // 是否送医
+  needRevisit: boolean // 是否需要后续复访
+  revisitNote?: string // 复访安排/说明
+  note?: string
+}
+
+export const ELDER_STATUS_LABEL: Record<DoorVisitReport['elderStatus'], string> = {
+  good: '平安无碍',
+  minor: '轻伤/受惊吓，无生命危险',
+  serious: '伤情较重，需医疗处置',
+}
+
 export interface AlertEvent {
   id: string
   elderId: string
@@ -169,10 +189,13 @@ export interface AlertEvent {
     dispatchedAt: number
     assignee: string
     arrivedAt?: number
+    contactedProperty?: boolean // 到达时是否联系物业
+    needEmergency?: boolean // 现场是否需要急救（120）
     result?: 'ok' | 'no_answer' | 'need_medical'
     note?: string
     propertyInvolved: boolean
     usedKeyCustody: boolean
+    report?: DoorVisitReport // 上门结束报告（结案必填）
   }
   medical?: {
     called120: boolean
